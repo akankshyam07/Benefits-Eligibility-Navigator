@@ -1,85 +1,83 @@
 # Benefits Eligibility Navigator
 
-An AI-powered web app that helps people in financial hardship discover government assistance programs they qualify for — SNAP, Medicaid, EITC, and Section 8.
+Benefits Eligibility Navigator helps people quickly check if they might qualify for key U.S. support programs:
+- SNAP
+- Medicaid
+- EITC
+- Section 8
 
-A LangChain ReAct agent powered by Groq (LLaMA 3 70B) checks all four programs, explains eligibility in plain English, and ends every response with a prioritized action plan and direct application links.
+The app is designed to feel calm and easy to use. It gives a ranked action plan, explains why each program may fit, and links to official sites.
 
-![Benefits Navigator](https://img.shields.io/badge/stack-FastAPI%20%2B%20React-6366f1?style=flat-square)
-![LLM](https://img.shields.io/badge/LLM-LLaMA%203%2070B%20via%20Groq-orange?style=flat-square)
-![License](https://img.shields.io/badge/license-MIT-green?style=flat-square)
+## What this app includes
 
----
+- A clean landing page at `/`
+- A separate eligibility workflow at `/navigator`
+- Step by step intake form with simple language
+- Program ranking with estimated value and reasons
+- Action plan copy and download options
+- English and Spanish UI
+- Optional document upload (PDF, image, text)
+- Local saved checks in browser storage (no account required)
 
-## Features
+## Tech stack
 
-- **4-step form** — household size, income, employment status, disability/children
-- **Live agent reasoning** — watch the AI check each program in real time via SSE streaming
-- **Deterministic FPL math** — SNAP (130% FPL), Medicaid (138% FPL), EITC (2024 limits), Section 8 (50% AMI)
-- **RAG over eligibility PDFs** — drop your own PDFs into `backend/data/` and ingest them into Pinecone
-- **MySQL persistence** — saves every profile and result for later retrieval
-- **Graceful degradation** — works without Pinecone or MySQL (falls back to hardcoded 2024 rules)
+- Backend: FastAPI
+- AI + tools: LangChain, Groq, rule based analysis
+- Optional retrieval: Pinecone + sentence-transformers
+- Optional persistence: MySQL
+- Frontend: React, Vite, Tailwind CSS
+- Routing: React Router
+- Streaming: Server-Sent Events (SSE)
 
----
+## Project structure
 
-## Stack
+```text
+backend/
+  app/
+    main.py
+    agent.py
+    analysis.py
+    tools.py
+    database.py
+  ingest.py
+  requirements.txt
+  .env.example
 
-| Layer | Tech |
-|-------|------|
-| Backend | FastAPI, LangChain, Groq (LLaMA 3 70B) |
-| Vector store | Pinecone + sentence-transformers/all-MiniLM-L6-v2 |
-| Database | MySQL |
-| Frontend | React 18, Vite, TailwindCSS |
-| Streaming | Server-Sent Events (SSE) |
-
----
-
-## Project Structure
-
+frontend/
+  src/
+    App.jsx
+    pages/
+      LandingPage.jsx
+      NavigatorPage.jsx
+    components/
+      Header.jsx
+      StepForm.jsx
+      ResultsPanel.jsx
 ```
-├── backend/
-│   ├── app/
-│   │   ├── main.py        # FastAPI app, CORS, SSE endpoint
-│   │   ├── agent.py       # LangChain ReAct agent + streaming callbacks
-│   │   ├── tools.py       # Benefits.gov API, Pinecone RAG, FPL calculator
-│   │   └── database.py    # MySQL: profiles + results
-│   ├── ingest.py          # One-time PDF → Pinecone ingestion
-│   ├── data/              # Drop eligibility PDFs here
-│   ├── requirements.txt
-│   └── .env.example
-└── frontend/
-    └── src/
-        ├── App.jsx
-        └── components/
-            ├── Header.jsx
-            ├── StepForm.jsx      # 4-step form
-            └── ResultsPanel.jsx  # Live agent steps + streaming answer
-```
 
----
+## Local setup
 
-## Getting Started
-
-### 1. Get free API keys
-
-- **Groq** — [console.groq.com](https://console.groq.com) → API Keys (free, fast LLaMA 3)
-- **Pinecone** — [app.pinecone.io](https://app.pinecone.io) → Starter tier is free (optional — app works without it)
-
-### 2. Backend setup
+### 1) Backend
 
 ```bash
 cd backend
 python3 -m venv .venv
 source .venv/bin/activate
-
 pip install -r requirements.txt
 
 cp .env.example .env
-# Fill in GROQ_API_KEY, PINECONE_API_KEY, PINECONE_INDEX_NAME, MySQL creds
+# Add GROQ_API_KEY at minimum
 
 uvicorn app.main:app --reload --port 8000
 ```
 
-### 3. Frontend setup
+Health check:
+
+```bash
+curl http://localhost:8000/health
+```
+
+### 2) Frontend
 
 ```bash
 cd frontend
@@ -87,11 +85,13 @@ npm install
 npm run dev
 ```
 
-Open [http://localhost:5173](http://localhost:5173).
+Open:
+- Landing page: http://localhost:5173/
+- Navigator page: http://localhost:5173/navigator
 
-### 4. (Optional) Ingest eligibility PDFs
+## Optional: ingest your own PDF rules
 
-Drop PDF files into `backend/data/`, then:
+Put PDF files in `backend/data/`, then run:
 
 ```bash
 cd backend
@@ -99,35 +99,32 @@ source .venv/bin/activate
 python ingest.py
 ```
 
-This chunks the PDFs, embeds them locally, and upserts to Pinecone.
+## API endpoints
 
----
+- `GET /health`
+- `POST /check-eligibility`
+- `POST /check-eligibility/stream`
+- `POST /documents/upload`
+- `GET /profile/{id}`
 
-## API Endpoints
-
-| Method | Path | Description |
-|--------|------|-------------|
-| `GET` | `/health` | Liveness probe |
-| `POST` | `/check-eligibility` | Run agent, return full JSON |
-| `POST` | `/check-eligibility/stream` | Run agent, stream SSE events |
-| `GET` | `/profile/{id}` | Fetch saved profile + last result |
-
----
-
-## Environment Variables
+## Environment variables
 
 ```env
-GROQ_API_KEY=           # Required
-PINECONE_API_KEY=       # Optional
-PINECONE_INDEX_NAME=    # Optional (default: benefits-eligibility)
-MYSQL_HOST=             # Optional (default: localhost)
-MYSQL_USER=             # Optional
-MYSQL_PASSWORD=         # Optional
-MYSQL_DB=               # Optional (default: benefits_navigator)
+GROQ_API_KEY=
+PINECONE_API_KEY=
+PINECONE_INDEX_NAME=benefits-eligibility
+MYSQL_HOST=localhost
+MYSQL_USER=root
+MYSQL_PASSWORD=
+MYSQL_DB=benefits_navigator
 ```
 
----
+## Notes for open source use
+
+- The frontend saves user checks in local browser storage by default.
+- The current UI does not rely on numeric profile IDs.
+- If you want shared multi-user history, add authentication and secure server-side ownership checks.
 
 ## Disclaimer
 
-This tool provides general information only and is not legal or financial advice. Always verify eligibility directly with the relevant government agency.
+This tool provides general guidance only. It is not legal, tax, or financial advice. Always confirm final eligibility with official agencies.

@@ -12,10 +12,12 @@ import asyncio
 import json
 import logging
 import os
+import re
+from pathlib import Path
 from contextlib import asynccontextmanager
 
 from dotenv import load_dotenv
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, File, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 from sse_starlette.sse import EventSourceResponse
@@ -23,6 +25,8 @@ from sse_starlette.sse import EventSourceResponse
 load_dotenv()
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
+UPLOAD_DIR = Path(__file__).resolve().parent.parent / "uploads"
+UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
 
 
 # ── Startup / shutdown ────────────────────────────────────────────────────────
@@ -52,6 +56,13 @@ app.add_middleware(
 
 # ── Request / response models ─────────────────────────────────────────────────
 
+class UploadedDocument(BaseModel):
+    name: str
+    mime_type: str = ""
+    size_bytes: int = 0
+    server_path: str = ""
+
+
 class EligibilityRequest(BaseModel):
     household_size:    int   = Field(default=1,  ge=1, le=20)
     state:             str   = Field(default="TX", min_length=2, max_length=2)
@@ -59,7 +70,20 @@ class EligibilityRequest(BaseModel):
     employment_status: str   = Field(default="unemployed")
     has_children:      bool  = Field(default=False)
     has_disability:    bool  = Field(default=False)
+    language:          str   = Field(default="en", min_length=2, max_length=2)
+    caseworker_mode:   bool  = Field(default=False)
+    case_label:        str   = Field(default="", max_length=120)
+    uploaded_documents: list[UploadedDocument] = Field(default_factory=list)
     additional_context: str  = Field(default="")
+
+
+def _normalize_language(lang: str) -> str:
+    lang = (lang or "en").lower()
+    return lang if lang in {"en", "es"} else "en"
+
+
+def _serialize_uploaded_documents(req: EligibilityRequest) -> list[dict]:
+    return [doc.model_dump() for doc in req.uploaded_documents]
 
 
 # ── Health ────────────────────────────────────────────────────────────────────
@@ -73,13 +97,16 @@ async def health():
 
 @app.post("/check-eligibility")
 async def check_eligibility(req: EligibilityRequest):
-    from .agent import build_user_prompt, run_agent_stream
-    from .database import save_profile, save_result
+    from .agent import run_agent_stream
+    from .analysis import build_structured_analysis
+    from .database import save_profile, save_result_with_analysis
 
     user_data = req.model_dump()
+    user_data["language"] = _normalize_language(req.language)
     queue: asyncio.Queue = asyncio.Queue()
 
     final_answer = await run_agent_stream(user_data, queue)
+    analysis = build_structured_analysis(user_data)
 
     profile_id = save_profile(
         household_size=req.household_size,
@@ -88,14 +115,19 @@ async def check_eligibility(req: EligibilityRequest):
         employment_status=req.employment_status,
         has_children=req.has_children,
         has_disability=req.has_disability,
+        language=user_data["language"],
+        caseworker_mode=req.caseworker_mode,
+        case_label=req.case_label,
+        uploaded_documents=_serialize_uploaded_documents(req),
         additional_context=req.additional_context,
     )
     if profile_id:
-        save_result(profile_id, final_answer)
+        save_result_with_analysis(profile_id, final_answer, analysis)
 
     return {
         "profile_id": profile_id,
         "answer": final_answer,
+        "analysis": analysis,
     }
 
 
@@ -104,9 +136,11 @@ async def check_eligibility(req: EligibilityRequest):
 @app.post("/check-eligibility/stream")
 async def stream_eligibility(req: EligibilityRequest):
     from .agent import run_agent_stream
-    from .database import save_profile, save_result
+    from .analysis import build_structured_analysis
+    from .database import save_profile, save_result_with_analysis
 
     user_data = req.model_dump()
+    user_data["language"] = _normalize_language(req.language)
     queue: asyncio.Queue = asyncio.Queue(maxsize=256)
     final_parts: list[str] = []
 
@@ -132,8 +166,12 @@ async def stream_eligibility(req: EligibilityRequest):
             if event_type in ("done", "error"):
                 break
 
-        # Persist after streaming completes
-        full_answer = "".join(final_parts)
+        # Persist after streaming completes.
+        task_answer = await agent_task
+        full_answer = "".join(final_parts).strip() or task_answer
+        analysis = build_structured_analysis(user_data)
+        yield {"event": "analysis", "data": json.dumps(analysis)}
+
         if full_answer:
             profile_id = save_profile(
                 household_size=req.household_size,
@@ -142,24 +180,68 @@ async def stream_eligibility(req: EligibilityRequest):
                 employment_status=req.employment_status,
                 has_children=req.has_children,
                 has_disability=req.has_disability,
+                language=user_data["language"],
+                caseworker_mode=req.caseworker_mode,
+                case_label=req.case_label,
+                uploaded_documents=_serialize_uploaded_documents(req),
                 additional_context=req.additional_context,
             )
             if profile_id:
-                save_result(profile_id, full_answer)
+                save_result_with_analysis(profile_id, full_answer, analysis)
                 # Send profile_id so frontend can bookmark it
                 yield {"event": "profile_id", "data": str(profile_id)}
 
-        await agent_task  # ensure task is cleaned up
-
     return EventSourceResponse(event_generator())
+
+
+@app.post("/documents/upload")
+async def upload_documents(files: list[UploadFile] = File(...)):
+    uploaded = []
+    rejected = []
+
+    for file in files:
+        raw = await file.read()
+        size = len(raw)
+        suffix = Path(file.filename or "").suffix.lower()
+        safe_name = re.sub(r"[^a-zA-Z0-9._-]", "_", file.filename or "document")
+
+        if suffix not in {".pdf", ".png", ".jpg", ".jpeg", ".txt"}:
+            rejected.append({"name": file.filename, "reason": "unsupported_file_type"})
+            continue
+        if size > 5 * 1024 * 1024:
+            rejected.append({"name": file.filename, "reason": "file_too_large"})
+            continue
+
+        server_name = f"{os.urandom(6).hex()}_{safe_name}"
+        path = UPLOAD_DIR / server_name
+        path.write_bytes(raw)
+
+        uploaded.append(
+            {
+                "name": safe_name,
+                "mime_type": file.content_type or "",
+                "size_bytes": size,
+                "server_path": str(path),
+            }
+        )
+
+    return {"uploaded": uploaded, "rejected": rejected}
 
 
 # ── GET /profile/{profile_id} ─────────────────────────────────────────────────
 
 @app.get("/profile/{profile_id}")
 async def get_profile(profile_id: int):
+    from .analysis import build_structured_analysis
     from .database import get_profile as db_get_profile
+
     data = db_get_profile(profile_id)
     if not data:
         raise HTTPException(status_code=404, detail="Profile not found.")
+
+    profile = data.get("profile") or {}
+    latest = data.get("latest_result") or {}
+    if not latest.get("analysis"):
+        latest["analysis"] = build_structured_analysis(profile)
+    data["latest_result"] = latest
     return data

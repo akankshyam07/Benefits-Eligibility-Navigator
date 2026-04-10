@@ -14,16 +14,24 @@ import logging
 import os
 from typing import Any
 
-from langchain.agents import AgentExecutor, create_react_agent
 from langchain_core.callbacks.base import BaseCallbackHandler
 from langchain_core.prompts import PromptTemplate
 from langchain_groq import ChatGroq
 
+from .analysis import build_structured_analysis
 from .tools import calculate_eligibility, check_eligibility_rules, search_benefits_gov
 
 logger = logging.getLogger(__name__)
 
 TOOLS = [search_benefits_gov, check_eligibility_rules, calculate_eligibility]
+
+try:
+    from langchain.agents import AgentExecutor, create_react_agent
+    _HAS_CLASSIC_REACT = True
+except Exception:
+    AgentExecutor = None  # type: ignore[assignment]
+    create_react_agent = None  # type: ignore[assignment]
+    _HAS_CLASSIC_REACT = False
 
 # ── Prompt ────────────────────────────────────────────────────────────────────
 
@@ -34,14 +42,16 @@ financial hardship discover government assistance programs they qualify for.
 RULES YOU MUST FOLLOW:
 1. Always check ALL FOUR programs: SNAP, Medicaid, EITC, and Section 8.
 2. If someone mentions recent job loss, treat income as $0 even if income was entered.
-3. Speak in plain English — no government jargon.
+3. Write in the user's requested language (English or Spanish).
 4. Be warm, encouraging, and non-judgmental.
 5. End every response with a PRIORITIZED ACTION PLAN that includes direct links.
+6. Use plain language and short sentences. Avoid legal or policy jargon.
+7. Do not use em dashes.
 
 Available tools:
 {tools}
 
-Use EXACTLY this format — do not deviate:
+Use EXACTLY this format. Do not deviate:
 
 Question: the input question you must answer
 Thought: think step-by-step about what to do
@@ -50,14 +60,14 @@ Action Input: the input to the action
 Observation: the result of the action
 ... (repeat Thought/Action/Action Input/Observation as many times as needed)
 Thought: I now know the final answer
-Final Answer: [Your complete, friendly assessment — include all 4 programs,
+Final Answer: [Your complete, friendly assessment, include all 4 programs,
 plain-English explanations, and finish with:]
 
 ## Your Prioritized Action Plan
-1. [Highest priority program] – Apply at [direct URL]
-2. [Second priority] – Apply at [direct URL]
-3. [Third priority] – Apply at [direct URL]
-4. [Fourth priority] – Apply at [direct URL]
+1. [Highest priority program] - Apply at [direct URL]
+2. [Second priority] - Apply at [direct URL]
+3. [Third priority] - Apply at [direct URL]
+4. [Fourth priority] - Apply at [direct URL]
 
 Application links:
 • SNAP:      https://www.benefits.gov/benefit/361
@@ -142,11 +152,15 @@ def build_user_prompt(data: dict) -> str:
     """Convert form data dict into a natural-language prompt for the agent."""
     income = data.get("monthly_income", 0)
     employment = data.get("employment_status", "unknown")
+    language = (data.get("language") or "en").lower()
+    caseworker_mode = bool(data.get("caseworker_mode", False))
+    case_label = (data.get("case_label") or "").strip()
+    uploaded_documents = data.get("uploaded_documents") or []
     ctx = data.get("additional_context", "").strip()
 
     # Infer zero/low income if recently unemployed
     if "recent" in employment.lower() or "loss" in employment.lower() or "unemployed" in employment.lower():
-        income_str = f"${income}/month (recently lost job — income may be $0 now)"
+        income_str = f"${income}/month (recently lost job, income may be $0 now)"
     else:
         income_str = f"${income}/month"
 
@@ -157,7 +171,21 @@ def build_user_prompt(data: dict) -> str:
         f"Employment status: {employment}",
         f"Has dependent children: {data.get('has_children', False)}",
         f"Has disability in household: {data.get('has_disability', False)}",
+        f"Preferred response language: {'Spanish' if language == 'es' else 'English'}",
     ]
+    if caseworker_mode:
+        lines.append("Caseworker mode: true (user may be helping another household)")
+    if case_label:
+        lines.append(f"Case label: {case_label}")
+    if uploaded_documents:
+        doc_lines = []
+        for doc in uploaded_documents:
+            if isinstance(doc, dict):
+                name = doc.get("name", "document")
+                size = doc.get("size_bytes", 0)
+                doc_lines.append(f"{name} ({size} bytes)")
+        if doc_lines:
+            lines.append("Uploaded documents: " + ", ".join(doc_lines))
     if ctx:
         lines.append(f"Additional context: {ctx}")
 
@@ -167,7 +195,10 @@ def build_user_prompt(data: dict) -> str:
     )
 
 
-def _make_executor(callback: _StreamingCallback) -> AgentExecutor:
+def _make_executor(callback: _StreamingCallback):
+    if not _HAS_CLASSIC_REACT:
+        raise RuntimeError("Classic LangChain ReAct agent APIs are unavailable in this runtime.")
+
     llm = ChatGroq(
         model="llama3-70b-8192",
         temperature=0.1,
@@ -175,6 +206,54 @@ def _make_executor(callback: _StreamingCallback) -> AgentExecutor:
         api_key=os.getenv("GROQ_API_KEY"),
         callbacks=[callback],
     )
+
+
+def _build_fallback_answer(user_data: dict) -> str:
+    """Deterministic answer used when classic agent APIs are unavailable."""
+    analysis = build_structured_analysis(user_data)
+    lang = analysis.get("language", "en")
+    programs = analysis.get("programs", [])
+    plan = analysis.get("action_plan", [])
+
+    if lang == "es":
+        lines = [
+            "Evaluamos SNAP, Medicaid, EITC y Section 8 con reglas basadas en ingresos y tamano del hogar.",
+            analysis.get("summary", ""),
+            "",
+            "Resumen por programa:",
+        ]
+        for p in programs:
+            lines.append(f"- {p['name']}: {p['status_label']} ({p['estimated_value']})")
+            for reason in p.get("why", [])[:2]:
+                lines.append(f"  • {reason}")
+            lines.append(f"  Solicitud: {p['apply_url']}")
+
+        lines.extend(["", "Plan de accion priorizado:"])
+        for step in plan:
+            lines.append(f"{step['rank']}. {step['title']}")
+            lines.append(f"   {step['reason']}")
+            lines.append(f"   {step['url']}")
+        return "\n".join(lines).strip()
+
+    lines = [
+        "We checked SNAP, Medicaid, EITC, and Section 8 using rule-based income and household estimates.",
+        analysis.get("summary", ""),
+        "",
+        "Program summary:",
+    ]
+    for p in programs:
+        lines.append(f"- {p['name']}: {p['status_label']} ({p['estimated_value']})")
+        for reason in p.get("why", [])[:2]:
+            lines.append(f"  • {reason}")
+        lines.append(f"  Apply: {p['apply_url']}")
+
+    lines.extend(["", "Prioritized action plan:"])
+    for step in plan:
+        lines.append(f"{step['rank']}. {step['title']}")
+        lines.append(f"   {step['reason']}")
+        lines.append(f"   {step['url']}")
+
+    return "\n".join(lines).strip()
     agent = create_react_agent(llm=llm, tools=TOOLS, prompt=REACT_PROMPT)
     return AgentExecutor(
         agent=agent,
@@ -192,6 +271,17 @@ async def run_agent_stream(user_data: dict, queue: asyncio.Queue) -> str:
     Returns the final answer string (also available via token events).
     """
     callback = _StreamingCallback(queue)
+
+    if not _HAS_CLASSIC_REACT:
+        callback._put("step", "Running eligibility engine in compatibility mode.")
+        callback._put("step", "Building a structured action plan.")
+        text = _build_fallback_answer(user_data)
+        for token in text.split(" "):
+            if token:
+                callback._put("token", token + " ")
+        callback._put("done", "")
+        return text
+
     prompt = build_user_prompt(user_data)
 
     loop = asyncio.get_event_loop()
